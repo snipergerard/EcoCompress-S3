@@ -1,0 +1,76 @@
+import boto3
+import json
+import zipfile
+import os
+
+# Configuraciones iniciales
+REGION = "us-east-1"
+BUCKET_NAME = "ecocompress-s3-storage-gerardo" # Cambia esto por uno único
+LAMBDA_NAME = "EcoCompressProcessor"
+ROLE_NAME = "EcoCompressLambdaRole"
+
+
+s3 = boto3.client('s3', region_name=REGION)
+iam = boto3.client('iam', region_name=REGION)
+awslambda = boto3.client('lambda', region_name=REGION)
+
+
+def create_bucket():
+    print(f"[*] Creando bucket: {BUCKET_NAME}...")
+    try:
+        s3.create_bucket(Bucket=BUCKET_NAME)
+        print("[+] Bucket creado exitosamente.")
+    except Exception as e:
+        print(f"[-] Error al crear bucket: {e}")
+
+def create_iam_role():
+    print(f"[*] Creando rol de IAM: {ROLE_NAME}...")
+    trust_policy = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    }
+
+    try:
+        role = iam.create_role(
+            RoleName=ROLE_NAME,
+            AssumeRolePolicyDocument=json.dumps(trust_policy)
+        )
+        #Adjuntar politicas basicas (Logs y S3 Full Access para este proyecto)
+        iam.attach_role_policy(RoleName=ROLE_NAME, PolicyArn='arn:aws:iam::aws:policy/AmazonS3FullAccess')
+        iam.attach_role_policy(RoleName=ROLE_NAME, PolicyArn='arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole')
+        print("[+] Rol creado y políticas adjuntadas.")
+        return role['Role']['Arn']
+    except iam.exceptions.EntityAlreadyExistsException:
+        print("[!] El rol ya existe, obteniendo ARN...")
+        return iam.get_role(RoleName=ROLE_NAME)['Role']['Arn']
+    
+
+def deploy_lambda(role_arn):
+    print("[*] Preparando archivo ZIP de la Lambda...")
+    #Creamos un archivo temporal para la lambda
+    with open('lambda_function.zip', 'rb') as f:
+        zipped_code = f.read()
+
+    try:
+        awslambda.create_function(
+            FunctionName=LAMBDA_NAME,
+            Runtime='python3.9',
+            Role=role_arn,
+            Handler='lambda_function.handler',
+            Code={'ZipFile': zipped_code},
+            Description='Función para compresión sustentable de archivos en S3',
+            Timeout=60 # Un minuto para procesos de compresión
+        )
+        print("[+] Lambda desplegada.")
+    except Exception as e:
+        print(f"[-] Error al desplegar Lambda: {e}")
+
+if __name__ == "__main__":
+    create_bucket()
+    role_arn = create_iam_role()
+    #Esperaremos unos segundos a que los roles se propaguen en AWS
+    import time
+    print("[*] Esperando propagacion de permisos...")
+    time.sleep(10)
+    deploy_lambda(role_arn)
+    print("\n[!!!] infraestructura base lista")
