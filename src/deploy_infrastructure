@@ -1,53 +1,46 @@
 import boto3
 import json
 import zipfile
-import os
+import time
 
-# Configuraciones iniciales
+# --- CONFIGURACIÓN ---
 REGION = "us-east-1"
-BUCKET_NAME = "ecocompress-s3-storage-gerardo" # Cambia esto por uno único
+BUCKET_NAME = "ecocompress-s3-storage-gerardo" 
 LAMBDA_NAME = "EcoCompressProcessor"
-ROLE_NAME = "EcoCompressLambdaRole"
+#correo electronico en donde se enviaran las alertas  de resilencia
+USER_EMAIL = " " #En este caso, agrega tu correo elctronico, para que puedas recibir alertas, en caso de que el sistema pueda fallar, pero recuerda que al ejecutar el script, debes aceptar suscripcion
 
+# IMPORTANTE: Reemplaza este ARN con el de tu "LabRole" de la consola de AWS
+# Lo encuentras en IAM -> Roles -> LabRole
+EXISTING_ROLE_ARN = "arn:aws:iam::137303519813:role/LabRole" 
 
 s3 = boto3.client('s3', region_name=REGION)
-iam = boto3.client('iam', region_name=REGION)
 awslambda = boto3.client('lambda', region_name=REGION)
-
+sns = boto3.client('sns', region_name=REGION)
+cw_client = boto3.client('cloudwatch', region_name=REGION)
 
 def create_bucket():
     print(f"[*] Creando bucket: {BUCKET_NAME}...")
     try:
         s3.create_bucket(Bucket=BUCKET_NAME)
         print("[+] Bucket creado exitosamente.")
+    except s3.exceptions.BucketAlreadyOwnedByYou:
+        print("[!] El bucket ya es tuyo.")
     except Exception as e:
         print(f"[-] Error al crear bucket: {e}")
 
-def create_iam_role():
-    print(f"[*] Creando rol de IAM: {ROLE_NAME}...")
-    trust_policy = {
-        "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]
-    }
-
+def deploy_lambda(role_arn):
+    print("[*] Empaquetando codigo real de EcoCompress...")
+    #Creamos el ZIP usando el archivo lamba_function.py 
     try:
-        role = iam.create_role(
-            RoleName=ROLE_NAME,
-            AssumeRolePolicyDocument=json.dumps(trust_policy)
-        )
-        #Adjuntar politicas basicas (Logs y S3 Full Access para este proyecto)
-        iam.attach_role_policy(RoleName=ROLE_NAME, PolicyArn='arn:aws:iam::aws:policy/AmazonS3FullAccess')
-        iam.attach_role_policy(RoleName=ROLE_NAME, PolicyArn='arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole')
-        print("[+] Rol creado y políticas adjuntadas.")
-        return role['Role']['Arn']
-    except iam.exceptions.EntityAlreadyExistsException:
-        print("[!] El rol ya existe, obteniendo ARN...")
-        return iam.get_role(RoleName=ROLE_NAME)['Role']['Arn']
+        with zipfile.ZipFile('lambda_function.zip', 'w') as z:
+            z.write('lambda_function.py')
+    except FileNotFoundError:
+        print("[-] Error: No encontré el archivo lambda_function.py en esta carpeta.")
+        return
     
 
-def deploy_lambda(role_arn):
-    print("[*] Preparando archivo ZIP de la Lambda...")
-    #Creamos un archivo temporal para la lambda
+    print(f"[*] Desplegando función Lambda: {LAMBDA_NAME}...")
     with open('lambda_function.zip', 'rb') as f:
         zipped_code = f.read()
 
@@ -58,19 +51,102 @@ def deploy_lambda(role_arn):
             Role=role_arn,
             Handler='lambda_function.handler',
             Code={'ZipFile': zipped_code},
-            Description='Función para compresión sustentable de archivos en S3',
-            Timeout=60 # Un minuto para procesos de compresión
+            Description='Compresión sustentable en S3',
+            Timeout=60
         )
         print("[+] Lambda desplegada.")
+    except awslambda.exceptions.ResourceConflictException:
+        print("[!] La Lambda ya existe. Actualizando código...")
+        awslambda.update_function_code(FunctionName=LAMBDA_NAME, ZipFile=zipped_code)
+        print("[+] Código actualizado.")
     except Exception as e:
         print(f"[-] Error al desplegar Lambda: {e}")
 
+
+
+def add_lambda_permission():
+    print("[*] Permitiendo que S3 invoque a la Lambda...")
+    try:
+        awslambda.add_permission(
+            FunctionName=LAMBDA_NAME,
+            StatementId='s3-trigger-permission',
+            Action='lambda:InvokeFunction',
+            Principal='s3.amazonaws.com',
+            SourceArn=f'arn:aws:s3:::{BUCKET_NAME}'
+        )
+        print("[+] Permiso otorgado.")
+    except awslambda.exceptions.ResourceConflictException:
+        print("[!] El permiso ya existia papito.")
+
+def configure_s3_notification():
+    print(f"[*] Configurando Trigger en el bucket {BUCKET_NAME}...")
+    #Obtenemos el ARN de la Lambda
+    lambda_info = awslambda.get_function(FunctionName=LAMBDA_NAME)
+    lambda_arn = lambda_info['Configuration']['FunctionArn']
+
+    notification_configuration = {
+        'LambdaFunctionConfigurations': [
+            {
+                'LambdaFunctionArn': lambda_arn,
+                'Events': ['s3:ObjectCreated:*']
+            }
+        ]
+    }
+    try:
+        s3.put_bucket_notification_configuration(
+            Bucket=BUCKET_NAME,
+            NotificationConfiguration=notification_configuration
+        )
+        print("[+] Trigger configurado exitosamente. ¡Automatización completa!")
+    except Exception as e:
+        print(f"[-] Error al configurar el trigger: {e}")
+
+def setup_resilience_alerts(email_address):
+    print(f"[*] Configurando alertas de resilencia para: {email_address}...")
+    try:
+        #Crear el tema de notificacion (SNS Topic)
+        topic = sns.create_topic(Name="EcoCompressAlerts")
+        topic_arn = topic['TopicArn']
+
+        #Suscribir el correo
+        sns.subscribe(
+            TopicArn = topic_arn,
+            Protocol = 'email',
+            Endpoint = email_address
+        )
+        print('[+] Suscripcion SNS creada. REVISA TU CORREO PARA CONFIRMAR.')
+
+        # Crear alarma en cloudwatch para errores de la lambda.
+        cw_client.put_metric_alarm(
+            AlarmName='EcoCompress_Failure_Alarm',
+            ComparisonOperator='GreaterThanThreshold',
+            EvaluationPeriods=1,
+            MetricName='Errors',
+            Namespace='AWS/Lambda',
+            Period=60,
+            Statistic='Sum',
+            Threshold=1.0,
+            ActionsEnabled=True,
+            AlarmActions=[topic_arn],
+            AlarmDescription='Alarma si la Lambda EcoCompress falla.',
+            Dimensions=[{'Name': 'FunctionName', 'Value': LAMBDA_NAME}]
+        )
+        print("[+] Alarma de resiliencia configurada en CloudWatch.")
+    except Exception as e:
+        print(f"[-] Error al configurar alertas: {e}")
+
+
 if __name__ == "__main__":
     create_bucket()
-    role_arn = create_iam_role()
-    #Esperaremos unos segundos a que los roles se propaguen en AWS
-    import time
-    print("[*] Esperando propagacion de permisos...")
-    time.sleep(10)
-    deploy_lambda(role_arn)
-    print("\n[!!!] infraestructura base lista")
+    #Despliegue de codigo.
+    deploy_lambda(EXISTING_ROLE_ARN)
+    
+    # NUEVOS PASOS
+    add_lambda_permission()
+    configure_s3_notification()
+    #Configuracion de monitoreo y resilencia
+    setup_resilience_alerts(USER_EMAIL)
+    
+    print(f"\n[PROYECTO LISTO]")
+    print(f"1. Revisa tu correo '{USER_EMAIL}' y confirma la suscripción de AWS.")
+    print(f"Sube un archivo .txt o .pdf a '{BUCKET_NAME}' y observa la magia.")
